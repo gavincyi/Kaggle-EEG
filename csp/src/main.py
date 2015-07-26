@@ -44,6 +44,7 @@ print(__doc__)
 
 import numpy as np
 import pandas as pd
+import timeit as tt
 import matplotlib.pyplot as plt
 from mne.io import RawArray
 from mne.channels import read_montage
@@ -58,8 +59,11 @@ from glob import glob
 from scipy.signal import butter, lfilter, convolve, boxcar
 from joblib import Parallel, delayed
 
+
 def create_mne_raw_object(fname,read_events=True):
-    """Create a mne raw instance from csv file"""
+    """ Create a mne raw instance from csv file
+    """
+
     # Read EEG file
     print('Reading file ' + fname + ' now...')
     data = pd.read_csv(fname)
@@ -96,7 +100,40 @@ def create_mne_raw_object(fname,read_events=True):
     
     return raw
 
+
+def filter_raw_data(raw):
+    """ Apply raw data filtering.
+
+    :param raw: Raw data
+    """
+    # Filter data for alpha frequency and beta band
+    # Note that MNE implement a zero phase (filtfilt) filtering not compatible
+    # with the rule of future data.
+    # Here we use left filter compatible with this constraint.
+    # The function parallelized for speeding up the script
+    raw._data[picks] = np.array([(lfilter)(b,a,raw._data[i]) for i in picks])
+
+
+def generate_csp_features(csp, raw):
+    """ Generate csp features and then smooth the features by convolution with a rectangle window.
+
+    :param csp: The trained csp filter
+    :param raw: The raw data
+    :return: The filtered features
+    """
+
+    # apply csp filters and rectify signal
+    feat = np.dot(csp.filters_[0:nfilters],raw._data[picks])**2
+
+    # smoothing by convolution with a rectangle window
+    # feattr = np.array(Parallel(n_jobs=-1)(delayed(convolve)(feat[i],boxcar(nwin),'full') for i in range(nfilters)))
+    feattr = np.array([(convolve)(feat[i],boxcar(nwin),'full') for i in range(nfilters)])
+    feattr = np.log(feattr[:,0:feat.shape[1]])
+
+    return feattr
+
 subjects = range(1,3)
+batch = 6
 ids_tot = []
 pred_tot = []
 
@@ -121,118 +158,108 @@ cols = ['HandStart','FirstDigitTouch',
         'BothStartLoadPhase','LiftOff',
         'Replace','BothReleased']
 
-for subject in subjects:
-    epochs_tot = []
-    y = []
+if __name__ == '__main__':
+    for subject in subjects:
+        epochs_tot = []
+        y = []
 
-    ################ READ DATA ################################################
-    fnames =  glob('../data/train/subj%d_series*_data.csv' % (subject))
+        ################ READ DATA ################################################
+        # fnames =  glob('../data/train/subj%d_series*_data.csv' % (subject))
+        fnames =  ['../data/train/subj%d_series%d_data.csv' % (subject, ix) for ix in range(5, batch + 1)]
 
-    # read and concatenate all the files
-    raw = concatenate_raws([create_mne_raw_object(fname) for fname in fnames])
+        # read and concatenate all the files
+        raw = concatenate_raws([create_mne_raw_object(fname) for fname in fnames])
 
-    # pick eeg signal
-    picks = pick_types(raw.info,eeg=True)
+        # pick eeg signal
+        picks = pick_types(raw.info,eeg=True)
 
-    # Filter data for alpha frequency and beta band
-    # Note that MNE implement a zero phase (filtfilt) filtering not compatible
-    # with the rule of future data.
-    # Here we use left filter compatible with this constraint.
-    # The function parallelized for speeding up the script
-    # raw._data[picks] = np.array(Parallel(n_jobs=-1)(delayed(lfilter)(b,a,raw._data[i]) for i in picks))
-    raw._data[picks] = np.array([(lfilter)(b,a,raw._data[i]) for i in picks])
+        # filter
+        filter_raw_data(raw)
 
-    ################ CSP Filters training #####################################
-    # get event posision corresponding to Replace
-    events = find_events(raw,stim_channel='Replace', verbose=False)
-    # epochs signal for 1.5 second before the movement
-    epochs = Epochs(raw, events, {'during' : 1}, -2, -0.5, proj=False,
-                    picks=picks, baseline=None, preload=True,
-                    add_eeg_ref=False, verbose=False)
+        ################ CSP Filters training #####################################
+        # get event posision corresponding to Replace
+        events = find_events(raw,stim_channel='Replace', verbose=False)
+        # epochs signal for 1.5 second before the movement
+        epochs = Epochs(raw, events, {'during' : 1}, -2, -0, proj=False,
+                        picks=picks, baseline=None, preload=True,
+                        add_eeg_ref=False, verbose=False)
 
-    epochs_tot.append(epochs)
-    y.extend([1]*len(epochs))
+        epochs_tot.append(epochs)
+        y.extend([1]*len(epochs))
 
-    # epochs signal for 1.5 second after the movement, this correspond to the
-    # rest period.
-    epochs_rest = Epochs(raw, events, {'after' : 1}, 0.5, 2, proj=False,
-                    picks=picks, baseline=None, preload=True,
-                    add_eeg_ref=False, verbose=False)
+        # epochs signal for 1.5 second after the movement, this correspond to the
+        # rest period.
+        epochs_rest = Epochs(raw, events, {'after' : 1}, 0, 2, proj=False,
+                        picks=picks, baseline=None, preload=True,
+                        add_eeg_ref=False, verbose=False)
 
-    # Workaround to be able to concatenate epochs with MNE
-    epochs_rest.times = epochs.times
+        # Workaround to be able to concatenate epochs with MNE
+        epochs_rest.times = epochs.times
 
-    y.extend([-1]*len(epochs_rest))
-    epochs_tot.append(epochs_rest)
+        y.extend([-1]*len(epochs_rest))
+        epochs_tot.append(epochs_rest)
 
-    # Concatenate all epochs
-    epochs = concatenate_epochs(epochs_tot)
+        # Concatenate all epochs
+        epochs = concatenate_epochs(epochs_tot)
 
-    # get data
-    X = epochs.get_data()
-    y = np.array(y)
+        # get data
+        X = epochs.get_data()
+        y = np.array(y)
 
-    # train CSP
-    csp = CSP(n_components=nfilters, reg='lws')
-    csp.fit(X,y)
+        # train CSP
+        csp = CSP(n_components=nfilters, reg='lws')
+        csp.fit(X,y)
 
-    ################ Create Training Features #################################
-    # apply csp filters and rectify signal
-    feat = np.dot(csp.filters_[0:nfilters],raw._data[picks])**2
+        ################ Create Training Features #################################
+        # apply csp and filtering
+        feattr = generate_csp_features(csp, raw)
 
-    # smoothing by convolution with a rectangle window
-    # feattr = np.array(Parallel(n_jobs=-1)(delayed(convolve)(feat[i],boxcar(nwin),'full') for i in range(nfilters)))
-    feattr = np.array([(convolve)(feat[i],boxcar(nwin),'full') for i in range(nfilters)])
-    feattr = np.log(feattr[:,0:feat.shape[1]])
+        # training labels
+        # they are stored in the 6 last channels of the MNE raw object
+        labels = raw._data[32:]
 
-    # training labels
-    # they are stored in the 6 last channels of the MNE raw object
-    labels = raw._data[32:]
+        ################ Create test Features #####################################
+        # read test data
+        # fnames =  glob('../data/train/subj%d_series*_data.csv' % (subject))
+        fnames =  ['../data/train/subj%d_series%d_data.csv' % (subject, ix) for ix in range(batch+1, 9)]
+        # raw = concatenate_raws([create_mne_raw_object(fname, read_events=False) for fname in fnames])
+        raw = concatenate_raws([create_mne_raw_object(fname, read_events=True) for fname in fnames])
+        # filter
+        filter_raw_data(raw)
 
-    ################ Create test Features #####################################
-    # read test data
-    fnames =  glob('../data/train/subj%d_series*_data.csv' % (subject))
-    raw = concatenate_raws([create_mne_raw_object(fname, read_events=False) for fname in fnames])
-    # raw._data[picks] = np.array(Parallel(n_jobs=-1)(delayed(lfilter)(b,a,raw._data[i]) for i in picks))
-    raw._data[picks] = np.array([(lfilter)(b,a,raw._data[i]) for i in picks])
+        labels_unbatch = raw._data[32:]
 
-    # read ids
-    ids = np.concatenate([np.array(pd.read_csv(fname)['id']) for fname in fnames])
-    ids_tot.append(ids)
+        # read ids
+        ids = np.concatenate([np.array(pd.read_csv(fname)['id']) for fname in fnames])
+        ids_tot.append(ids)
 
-    # apply preprocessing on test data
-    feat = np.dot(csp.filters_[0:nfilters],raw._data[picks])**2
-    # featte = np.array(Parallel(n_jobs=-1)(delayed(convolve)(feat[i],boxcar(nwin),'full') for i in range(nfilters)))
-    featte = np.array([(convolve)(feat[i],boxcar(nwin),'full') for i in range(nfilters)])
-    featte = np.log(featte[:,0:feat.shape[1]])
+        # apply preprocessing on test data
+        featte = generate_csp_features(csp, raw)
 
-    ################ Train classifiers ########################################
-    lr = LogisticRegression()
-    pred = np.empty((len(ids),6))
-    pred_train = np.empty((len(ids),6))
-    pred_roc_area = []
-    for i in range(6):
-        lr.fit(feattr[:,::subsample].T,labels[i,::subsample])
-        pred[:,i] = lr.predict_proba(featte.T)[:,1]
-        # calculate train data roc and its curve
-        pred_train[:,i] = lr.predict_proba(feattr.T)[:,1]
-        pred_roc_area.append(roc_auc_score(labels[i,:].T, pred_train[:,i]))
-        fpr, tpr, thresholds = roc_curve(labels[i,:].T, pred_train[:,i])
-        roc_auc = auc(x=fpr, y=tpr, reorder=True)
-        plt.plot(fpr, tpr, lw=1, label='ROC fold %d (area = %0.2f)' % (i, roc_auc))
-        print('Train subject %d, class %s, event %d roc area = %.5f' % (subject, cols[i], i, pred_roc_area[i]))
+        ################ Train classifiers ########################################
+        lr = LogisticRegression()
+        pred = np.empty((len(ids),6))
+        pred_roc_area = []
+        for i in range(6):
+            lr.fit(feattr[:,::subsample].T,labels[i,::subsample])
+            pred[:,i] = lr.predict_proba(featte.T)[:,1]
+            # calculate train data roc and its curve
+            pred_roc_area.append(roc_auc_score(labels_unbatch[i,:].T, pred[:,i]))
+            # fpr, tpr, thresholds = roc_curve(labels[i,:].T, pred_train[:,i])
+            # roc_auc = auc(x=fpr, y=tpr, reorder=True)
+            # plt.plot(fpr, tpr, lw=1, label='ROC fold %d (area = %0.2f)' % (i, roc_auc))
+            # print('Train subject %d, class %s, event %d roc area = %.5f' % (subject, cols[i], i, pred_roc_area[i]))
 
-    print('Roc area mean of train subject %d = %.5f' % (subject, np.mean(pred_roc_area)))
-    plt.plot([0, 1], [0, 1], '--', color=(0.6, 0.6, 0.6), label='Luck')
-    plt.show()
-    pred_tot.append(pred)
+        print('Roc area mean of train subject %d = %.5f' % (subject, np.mean(pred_roc_area)))
+        # plt.plot([0, 1], [0, 1], '--', color=(0.6, 0.6, 0.6), label='Luck')
+        # plt.show()
+        pred_tot.append(pred)
 
-# create pandas object for sbmission
-print(ids_tot)
-submission = pd.DataFrame(index=np.concatenate(ids_tot),
-                          columns=cols,
-                          data=np.concatenate(pred_tot))
+    # create pandas object for sbmission
+    submission = pd.DataFrame(index=np.concatenate(ids_tot),
+                              columns=cols,
+                              data=np.concatenate(pred_tot))
 
-# write file
-submission.to_csv(submission_file,index_label='id',float_format='%.3f')
+    # write file
+    submission.to_csv(submission_file,index_label='id',float_format='%.3f')
 
