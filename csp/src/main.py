@@ -44,6 +44,7 @@ print(__doc__)
 
 import numpy as np
 import pandas as pd
+from train_para import TrainPara
 from datetime import datetime
 from mne.io import RawArray
 from mne.channels import read_montage
@@ -55,7 +56,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.lda import LDA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, roc_curve, auc
-from glob import glob
 
 from scipy.signal import butter, lfilter, convolve, boxcar
 from joblib import Parallel, delayed
@@ -105,7 +105,7 @@ def create_mne_raw_object(fname, read_events=True):
 def butterworth_filter(t,k,l):
     if t==0:
         freq=[k, l]
-        b,a = butter(3,np.array(freq)/250.0,btype='bandpass')
+        b,a = butter(5,np.array(freq)/250.0,btype='bandpass')
     elif t==1:
         b,a = butter(3,k/250.0,btype='lowpass')
     elif t==2:
@@ -113,7 +113,7 @@ def butterworth_filter(t,k,l):
     return (b, a)
 
 
-def filter_raw_data(raw, picks):
+def filter_raw_data(raw, picks, training_parameters):
     """ Apply raw data filtering.
 
     :param raw: Raw data
@@ -125,25 +125,22 @@ def filter_raw_data(raw, picks):
     # The function parallelized for speeding up the script
 
     # design a butterworth bandpass filter
-    freqs = [7, 30]
+    # freqs = [7, 30]
     # b, a = butter(5, np.array(freqs) / 250.0, btype='bandpass')
-    for i in range(10):
-        # b, a = butter(5, np.array(freqs) / 250.0, btype='bandpass')
-        b, a = butterworth_filter(1, 2 - (i*0.2), 3)
-        raw._data[picks] = np.array([(lfilter)(b, a, raw._data[i]) for i in picks])
+    # for i in range(10):
+    b, a = butterworth_filter(training_parameters.butterworth_t,
+                              training_parameters.butterworth_k,
+                              training_parameters.butterworth_l)
+    raw._data[picks] = np.array([(lfilter)(b, a, raw._data[i]) for i in picks])
 
 
-def generate_csp_features(csp, raw, picks, nfilters):
+def generate_csp_features(csp, raw, picks, nwin, nfilters):
     """ Generate csp features and then smooth the features by convolution with a rectangle window.
 
     :param csp: The trained csp filter
     :param raw: The raw data
     :return: The filtered features
     """
-
-    # convolution
-    # window for smoothing features
-    nwin = 250
 
     # apply csp filters and rectify signal
     feat = np.dot(csp.filters_[0:nfilters], raw._data[picks]) ** 2
@@ -166,9 +163,9 @@ def csp_training(raw, picks, nfilters):
     y = []
 
     # get event position corresponding to Replace
-    events = find_events(raw, stim_channel='Replace', verbose=False)
+    events = find_events(raw, stim_channel='HandStart', verbose=False)
     # epochs signal for 1.5 second before the movement
-    epochs = Epochs(raw, events, {'during': 1}, -2, -0.5, proj=False,
+    epochs = Epochs(raw, events, {'during': 1}, 0, 2, proj=False,
                     picks=picks, baseline=None, preload=True,
                     add_eeg_ref=False, verbose=False)
 
@@ -177,7 +174,7 @@ def csp_training(raw, picks, nfilters):
 
     # epochs signal for 1.5 second after the movement, this correspond to the
     # rest period.
-    epochs_rest = Epochs(raw, events, {'after': 1}, 0.5, 2, proj=False,
+    epochs_rest = Epochs(raw, events, {'before': 1}, -2, 0, proj=False,
                          picks=picks, baseline=None, preload=True,
                          add_eeg_ref=False, verbose=False)
 
@@ -200,7 +197,7 @@ def csp_training(raw, picks, nfilters):
 
     return csp
 
-def model_training( subject ):
+def model_training( subject , training_parameters):
     """ Training the model.
 
     :param subject: The subject index
@@ -208,15 +205,19 @@ def model_training( subject ):
 
     # CSP parameters
     # Number of spatial filter to use
-    nfilters = 6
+    nfilters = training_parameters.csp_nfilter
 
     # training subsample
-    subsample = 30
+    subsample = training_parameters.subsample
+
+    # window
+    nwin = training_parameters.nwin
 
     # batching const
     batch_start = 1
     batch_end = 6
-    unbatch_start = batch_end + 1
+    # unbatch_start = batch_end + 1
+    unbatch_start = 7
     unbatch_end = 8
 
     ids_tot = []
@@ -233,14 +234,14 @@ def model_training( subject ):
     picks = pick_types(raw.info, eeg=True)
 
     # filter
-    filter_raw_data(raw, picks)
+    filter_raw_data(raw, picks, training_parameters)
 
     ################ CSP Filters training #####################################
     csp = csp_training(raw, picks, nfilters)
 
     ################ Create Training Features #################################
     # apply csp and filtering
-    feattr = generate_csp_features(csp, raw, picks, nfilters)
+    feattr = generate_csp_features(csp, raw, picks, nwin, nfilters)
 
     # training labels
     # they are stored in the 6 last channels of the MNE raw object
@@ -254,20 +255,23 @@ def model_training( subject ):
     raw = concatenate_raws([create_mne_raw_object(fname, read_events=True) for fname in fnames])
 
     # filter
-    filter_raw_data(raw, picks)
+    filter_raw_data(raw, picks, training_parameters)
 
     labels_unbatch = raw._data[32:]
 
     # apply preprocessing on test data
-    featte = generate_csp_features(csp, raw, picks, nfilters)
+    featte = generate_csp_features(csp, raw, picks, nwin, nfilters)
 
     # read ids
     ids = np.concatenate([np.array(pd.read_csv(fname)['id']) for fname in fnames])
     ids_tot.append(ids)
 
     ################ Train classifiers ########################################
-    lr = LogisticRegression()
-    # lr = LDA()
+    lr = []
+    if training_parameters.model == 1:
+        lr = LogisticRegression()
+    elif training_parameters.model == 2:
+        lr = LDA()
     pred = np.empty((len(ids), 6))
     pred_roc_area = []
     for i in range(6):
@@ -295,12 +299,21 @@ def data_preprocess_test(X):
 
 if __name__ == '__main__':
 
+    training_parameters = TrainPara()
+    training_parameters.nwin = 250
+    training_parameters.csp_nfilter = 4
+    training_parameters.butterworth_t = 0
+    training_parameters.butterworth_k = 7
+    training_parameters.butterworth_l = 30
+    training_parameters.model = 1
+    training_parameters.subsample = 10
+
     # time the execution
     run_start = datetime.now()
 
-    # Parallel(n_jobs=2)(delayed(model_training)(subject) for subject in subjects)
-    for subject in subjects:
-        model_training(subject)
+    Parallel(n_jobs=2)(delayed(model_training)(subject, training_parameters) for subject in subjects)
+    # for subject in subjects:
+    #     model_training(subject, training_parameters)
 
     print("Total run time : %s" % str(datetime.now() - run_start))
 
